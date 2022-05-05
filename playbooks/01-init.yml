@@ -1,0 +1,233 @@
+# Initial server setup
+#
+---
+- hosts: all
+  become: true
+  vars:
+    ssh_port: "28029"
+    my_client_ip: 89.187.162.95
+    tmzone: Europe/Berlin
+    sudo_timeout: 20
+    f2b_jail_local: |
+      [DEFAULT]
+      ignoreip = 127.0.0.1/8 ::1 {{ my_client_ip }}
+      findtime = 1h
+      bantime = 2h
+      maxretry = 3
+
+      [sshd]
+      enabled = true
+      port = {{ ssh_port }}
+
+  tasks:
+    - name: Get datestamp from the system
+      shell: date +"%Y%m%d"
+      register: dstamp
+
+    - name: Set current date stamp varible
+      set_fact:
+        cur_date: "{{ dstamp.stdout }}"
+
+    # Update and install the base software
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade installed apt packages 
+      apt:
+        upgrade: dist
+      register: upgrade
+      retries: 15
+      delay: 5
+      until: upgrade is success
+
+    - name: Ensure that these software packages are installed
+      apt:
+        pkg:
+          - build-essential
+          - fail2ban
+          - needrestart
+          - pwgen
+          - resolvconf
+          - unbound
+          - unzip
+          - mc
+          - htop
+          - git
+          - prometheus-node-exporter
+        state: latest
+
+    - name: Check if a reboot is needed for Debian-based systems
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    # Host Setup
+    - name: Set static hostname
+      hostname:
+        name: "{{ inventory_hostname_short }}"
+
+    - name: Add FQDN to /etc/hosts
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '^127\.0\.1\.1'
+        line: '127.0.1.1 {{ inventory_hostname }} {{ inventory_hostname_short }}'
+        state: present
+
+    - name: set timezone
+      timezone:
+        name: "{{ tmzone }}"
+
+    - name: Set ssh '{{ ssh_port }}' port number
+      lineinfile:
+        dest: /etc/ssh/sshd_config
+        regexp: 'Port '
+        line: 'Port {{ ssh_port }}'
+        state: present
+      notify:
+        - restart sshd
+
+    # Set sudo password timeout (default is 15 minutes)
+    - name: Set sudo password timeout.
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^Defaults\tenv_reset'
+        line: 'Defaults env_reset, timestamp_timeout={{ sudo_timeout }}'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Create/update regular user with sudo privileges
+      user:
+        name: "{{ user }}"
+        password: "{{ user_passwd | password_hash('sha512') }}"
+        state: present
+        groups: sudo
+        append: true
+        shell: /bin/bash
+
+    - name: Ensure authorized keys for remote user is installed
+      authorized_key:
+        user: "{{ user }}"
+        state: present
+        key: "{{ ssh_pub_key }}"
+
+    - name: Ensure authorized key for root user is installed
+      authorized_key:
+        user: root
+        state: present
+        key: "{{ ssh_pub_key }}"
+
+    - name: Update root user password.
+      user:
+        name: root
+        password: "{{ root_passwd | password_hash('sha512') }}"
+
+    - name: Disable password authentication for root
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        state: present
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+      notify:
+        - restart sshd
+
+    # Configure a firewall
+    - name: Disable and reset ufw firewall to installation defaults.
+      ufw:
+        state: reset
+
+    - name: Find backup rules to delete
+      find:
+        paths: /etc/ufw
+        patterns: "*.{{ cur_date }}_*"
+        use_regex: no
+      register: files_to_delete
+
+    - name: Delete ufw backup rules
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      with_items: "{{ files_to_delete.files }}"
+
+    - name: Allow ssh port '{{ ssh_port }}'.
+      ufw:
+        rule: allow
+        proto: tcp
+        port: '{{ ssh_port }}'
+        state: enabled
+
+    - name: Turn UFW logging off
+      ufw:
+        logging: "off"
+
+    - name: configure fail2ban for ssh
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: "{{ f2b_jail_local }}"
+        owner: root
+        group: root
+        mode: 0644
+      notify:
+        - restart fail2ban
+
+    # simple shell script to display fail2ban-client status info; usage:
+    #   f2bst
+    #   f2bst sshd
+    - name: Configure f2bst
+      copy:
+        dest: /usr/local/bin/f2bst
+        content: |
+          #!/usr/bin/sh
+          fail2ban-client status $*
+        owner: root
+        group: root
+        mode: 0750
+
+    - name: run needrestart
+      command: needrestart -r a
+      when: not reboot_required.stat.exists and upgrade.changed
+
+    - name: Reboot the server if needed
+      reboot:
+        msg: "Reboot initiated by Ansible because of reboot required file."
+        connect_timeout: 5
+        reboot_timeout: 600
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: whoami
+      when: reboot_required.stat.exists
+
+    - name: Remove old packages from the cache
+      apt:
+        autoclean: yes
+
+    - name: Remove dependencies that are no longer needed
+      apt:
+        autoremove: yes
+        purge: yes
+
+  handlers:
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted
+      when: reboot_required.stat.exists == false
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+      when: reboot_required.stat.exists == false
+
+    - name: restart systemd-resolved
+      service:
+        name: systemd-resolved
+        state: restarted
+      when: reboot_required.stat.exists == false
+
+    - name: netplan apply
+      command: netplan apply
+      when: cfg_static_network == true 
+
+      
